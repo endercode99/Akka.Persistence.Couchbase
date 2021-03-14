@@ -1,4 +1,27 @@
-﻿using System;
+﻿#region [ License information          ]
+
+/* ************************************************************
+ *
+ *    @author Couchbase <info@couchbase.com>
+ *    @copyright 2021 Couchbase, Inc.
+ *
+ *    Licensed under the Apache License, Version 2.0 (the "License");
+ *    you may not use this file except in compliance with the License.
+ *    You may obtain a copy of the License at
+ *
+ *        http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *    Unless required by applicable law or agreed to in writing, software
+ *    distributed under the License is distributed on an "AS IS" BASIS,
+ *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *    See the License for the specific language governing permissions and
+ *    limitations under the License.
+ *
+ * ************************************************************/
+
+#endregion
+
+using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Linq;
@@ -16,11 +39,10 @@ namespace Akka.Persistence.Couchbase.Journal
 
         private readonly CouchbaseJournalSettings _settings;
 
-        private readonly Akka.Serialization.Serialization _serialization;
-
         private ICluster _cluster;
-        private IBucket _bucket;
+        private IBucket _journalBucket;
         private ICouchbaseCollection _journalCollection;
+        private IBucket _metadataBucket;
         private ICouchbaseCollection _metadataCollection;
 
         private ImmutableDictionary<string, IImmutableSet<IActorRef>> _persistenceIdSubscribers = ImmutableDictionary.Create<string, IImmutableSet<IActorRef>>();
@@ -31,21 +53,18 @@ namespace Akka.Persistence.Couchbase.Journal
         {
             _settings = CouchbasePersistence.Get(Context.System).JournalSettings;
 
-            _serialization = Context.System.Serialization;
-
         }
 
 
-        protected override async void PreStart()
+        protected override void PreStart()
         {
             base.PreStart();
-
-            _cluster = await Cluster.ConnectAsync(_settings.ConnectionString,
-                    _settings.Username, _settings.Password);
-            _bucket = await _cluster.BucketAsync(_settings.Bucket);
-            _journalCollection = await _bucket.CollectionAsync(_settings.Collection);
-            _metadataCollection = await _bucket.CollectionAsync(_settings.MetadataCollection);
-
+            _cluster = Cluster.ConnectAsync(_settings.ConnectionString,
+                      _settings.Username, _settings.Password).Result;
+            _journalBucket =  _cluster.BucketAsync(_settings.JournalBucket).Result;
+            _journalCollection = _journalBucket.DefaultCollectionAsync().Result;
+            _metadataBucket = _cluster.BucketAsync(_settings.MetadataBucket).Result;
+            _metadataCollection = _metadataBucket.DefaultCollectionAsync().Result;
         }
 
         public override Task<long> ReadHighestSequenceNrAsync(string persistenceId, long fromSequenceNr)
@@ -55,23 +74,21 @@ namespace Akka.Persistence.Couchbase.Journal
 
         private async Task<long> ReadHighestSequenceNrTaskAsync(string persistenceId, long fromSequenceNr)
         {
-            string query = "SELECT MAX(s.SequenceNr) FROM `$bucket` s AS $resultField WHERE s.DocumentType =$documentType AND s.PersistenceId = $persistenceID";
+            string query = String.Format("SELECT {0}.* FROM {0} WHERE documentType=$documentType AND persistenceId=$persistenceID ORDER BY sequenceNr DESC LIMIT 1;",
+           _settings.JournalBucket);
 
-            var result = await _cluster.QueryAsync<dynamic>(
+            var result = await _cluster.QueryAsync<JournalEntry>(
                 query,
-                options => options.Parameter("bucket", _settings.Bucket)
+                options => options
                 .Parameter("persistenceID", persistenceId)
-                .Parameter("resultField", "MaxSequenceNr")
                 .Parameter("documentType", "JournalEntry")
             );
 
             long highestSeqNum = 0;
-
-            await foreach (var row in result)
+            await foreach (var row in result.Rows)
             {
-                highestSeqNum = long.TryParse(row.SequenceNr, out highestSeqNum);
+               long.TryParse(row.SequenceNr.ToString(), out highestSeqNum);
             }
-
             return highestSeqNum;
         }
 
@@ -80,22 +97,25 @@ namespace Akka.Persistence.Couchbase.Journal
         {
             var limitValue = max >= int.MaxValue ? int.MaxValue : (int)max;
 
-            string query = "SELECT s.* FROM `$bucket` s WHERE AND s.PersistenceId = $persistenceID AND s.SequenceNr >= $FromSequenceNr  AND s.SequenceNr <= $ToSequenceNr ORDER BY s.SequenceNr ASC LIMIT $limitValue";
+            string query = String.Format("SELECT {0}.* FROM {0} WHERE persistenceId=$persistenceID AND sequenceNr>=$FromSequenceNr AND sequenceNr<=$ToSequenceNr ORDER BY SequenceNr ASC LIMIT $limitValue", _settings.JournalBucket);
             return ReplayMessagesQueryAsync(context, query, persistenceId, fromSequenceNr, toSequenceNr, limitValue, recoveryCallback);
         }
 
         private async Task ReplayMessagesQueryAsync(IActorContext context, string query, string persistenceId, long fromSequenceNr, long toSequenceNr, int limitValue, Action<IPersistentRepresentation> recoveryCallback)
         {
+            if (limitValue == 0)
+                return;
+
             var result = await _cluster.QueryAsync<JournalEntry>(
                 query,
-                options => options.Parameter("bucket", _settings.Bucket)
+                options => options
                 .Parameter("persistenceID", persistenceId)
                 .Parameter("FromSequenceNr", fromSequenceNr)
                 .Parameter("ToSequenceNr", toSequenceNr)
                 .Parameter("limitValue", limitValue)
             );
 
-            await foreach (var row in result)
+            await foreach (var row in result.Rows)
             {
                 recoveryCallback(ToPersistenceRepresentation(row, context.Sender));
             }
@@ -104,7 +124,7 @@ namespace Akka.Persistence.Couchbase.Journal
 
         private Persistent ToPersistenceRepresentation(JournalEntry row, IActorRef sender)
         {
-            return new Persistent(row.Payload, row.SequenceNr, row.Manifest, row.PersistenceId, row.isDeleted, sender);
+          return new Persistent(row.Payload, row.SequenceNr, row.Manifest, row.PersistenceId, row.IsDeleted, sender);
         }
 
         protected override Task DeleteMessagesToAsync(string persistenceId, long toSequenceNr)
@@ -114,20 +134,19 @@ namespace Akka.Persistence.Couchbase.Journal
 
         private async Task DeleteMessagesToTaskAsync(string persistenceId, long toSequenceNr)
         {
-            string query = "DELETE FROM `$bucket` s WHERE s.PersistenceId = $persistenceID";
+            string query = String.Format("DELETE FROM {0} WHERE persistenceId=$persistenceID", _settings.JournalBucket);
 
-            if(toSequenceNr != long.MaxValue)
+            if (toSequenceNr != long.MaxValue)
             {
-                query += " AND s.SequenceNr <= $ToSequenceNr";
+                query += " AND sequenceNr<=$ToSequenceNr;";
             }
 
             await _cluster.QueryAsync<dynamic>(
                 query,
-                options => options.Parameter("bucket", _settings.Bucket)
+                options => options
                 .Parameter("persistenceID", persistenceId)
                 .Parameter("$ToSequenceNr", toSequenceNr)
             );
-
         }
 
         protected override async Task<IImmutableList<Exception>> WriteMessagesAsync(IEnumerable<AtomicWrite> messages)
@@ -154,7 +173,7 @@ namespace Akka.Persistence.Couchbase.Journal
                 foreach (IPersistentRepresentation persistentMessage in persistentMessages)
                 {
                     var journalEntry = ToJournalEntry(persistentMessage);
-                    await _journalCollection.InsertAsync<JournalEntry>(journalEntry.Id, journalEntry);
+                    await _journalCollection.UpsertAsync<JournalEntry>(journalEntry.Id, journalEntry);
                 }
 
                 if (HasPersistenceIdSubscribers)
@@ -214,18 +233,14 @@ namespace Akka.Persistence.Couchbase.Journal
                 message = message.WithPayload(payload);
             }
 
-
-            var serializer = _serialization.FindSerializerFor(message);
-            var binary = serializer.ToBinary(message);
-
-
             return new JournalEntry
             {
                 Id = message.PersistenceId + "_" + message.SequenceNr,
-                Payload = binary,
+                Payload = payload,
                 PersistenceId = message.PersistenceId,
                 SequenceNr = message.SequenceNr,
-                Manifest = string.Empty
+                Manifest = string.Empty,
+                IsDeleted = message.IsDeleted,
             };
         }
 

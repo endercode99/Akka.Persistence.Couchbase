@@ -22,26 +22,33 @@
 #endregion
 
 using System;
-namespace Akka.Persistence.Couchbase.Journal
+
+using Akka.Actor;
+
+
+namespace TestCore
 {
-    public class JournalEntry
+
+    class Program
     {
-        public JournalEntry()
+        static void Main(string[] args)
         {
-            DocumentType = "JournalEntry";
+            Console.WriteLine("Enter a command");
+
+            ExampleActorSystem.Start();
+
+            string command = string.Empty;
+            while (command != "exit")
+            {
+                command = Console.ReadLine();
+
+                if (command != "exit")
+                {
+                    ExampleActorSystem.ExampleActor.Tell(command);
+                }
+            }
+
+            ExampleActorSystem.Stop();
         }
-        public string Id { get; set; }
-
-        public string PersistenceId { get; set; }
-
-        public long SequenceNr { get; set; }
-
-        public bool IsDeleted { get; set; }
-
-        public object Payload { get; set; }
-
-        public string Manifest { get; set; }
-
-        public string DocumentType { get; set; }
     }
 }

@@ -4,6 +4,9 @@
     <TargetFramework>netstandard2.1</TargetFramework>
   </PropertyGroup>
 
+   <ItemGroup>
+    <EmbeddedResource Include="reference.conf" />
+  </ItemGroup>
   <ItemGroup>
     <PackageReference Include="CouchbaseNetClient" Version="3.1.2" />
     <PackageReference Include="Akka.Persistence.Query" Version="1.4.16" />
@@ -12,6 +15,5 @@
   <ItemGroup>
     <Folder Include="Journal\" />
     <Folder Include="Snapshot\" />
-    <Folder Include="Query\" />
   </ItemGroup>
 </Project>
